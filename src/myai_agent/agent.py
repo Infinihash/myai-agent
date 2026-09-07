@@ -30,7 +30,7 @@ from .config import get_config_dir
 
 log = logging.getLogger("myai_agent")
 
-VERSION = "2.2.0"  # v3-C: ECDSA P-256 attestation
+VERSION = "2.3.0"  # T10694: coordinator options envelope (num_ctx/format/keep_alive)
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -244,19 +244,129 @@ def _ollama_reachable(ollama_url: str = OLLAMA_URL) -> bool:
         return False
 
 
-def run_ollama(model: str, prompt: str, ollama_url: str = OLLAMA_URL, timeout: int = 120) -> str:
-    """Run inference. Detects JSON messages array → /api/chat, else → /api/generate."""
+# Sentinel used by the coordinator (api/routes/openai_compat.py) to smuggle
+# Ollama-native options (format, options, keep_alive) through the existing
+# messages pipeline without a DB schema change. The first message — if it's a
+# system role with this prefix — is lifted out and its JSON payload is merged
+# into the Ollama request body. Must stay byte-for-byte identical to the
+# coordinator's MYAI_OPTS_SENTINEL and the reference agent
+# (coordinator/static/agent/agent.py).
+MYAI_OPTS_SENTINEL = "__MYAI_OPTS__:"
+
+
+def _extract_opts_envelope(messages: list) -> tuple:
+    """Detect and strip the __MYAI_OPTS__ envelope from the first message.
+
+    Returns (cleaned_messages, extras_dict). extras_dict is empty if no
+    envelope was present. Malformed JSON is tolerated (ignored).
+    """
+    if not messages:
+        return messages, {}
+    first = messages[0]
+    content = first.get("content") if isinstance(first, dict) else None
+    if (isinstance(first, dict)
+            and first.get("role") == "system"
+            and isinstance(content, str)
+            and content.startswith(MYAI_OPTS_SENTINEL)):
+        try:
+            extras = json.loads(content[len(MYAI_OPTS_SENTINEL):])
+            if not isinstance(extras, dict):
+                extras = {}
+        except Exception as e:
+            log.warning(f"MYAI_OPTS envelope parse failed: {e}")
+            extras = {}
+        return messages[1:], extras
+    return messages, {}
+
+
+def _apply_opts_to_payload(payload: dict, extras: dict) -> dict:
+    """Merge extras (format / options / keep_alive) into an Ollama payload."""
+    if not extras:
+        return payload
+    if "format" in extras and extras["format"] is not None:
+        payload["format"] = extras["format"]
+    if "keep_alive" in extras and extras["keep_alive"] is not None:
+        payload["keep_alive"] = extras["keep_alive"]
+    if "options" in extras and isinstance(extras["options"], dict) and extras["options"]:
+        payload["options"] = extras["options"]
+    return payload
+
+
+def _num_ctx_default() -> int:
+    """num_ctx floor from MYAI_NUM_CTX (default 8192)."""
+    try:
+        return int(_env("MYAI_NUM_CTX", "8192"))
+    except (TypeError, ValueError):
+        return 8192
+
+
+def _ensure_num_ctx(payload: dict) -> dict:
+    """Belt-and-braces: guarantee num_ctx is set on the Ollama payload.
+
+    Ollama defaults to a 4096-token context and truncates prompts silently
+    from the front when they exceed it. An old coordinator that predates the
+    options envelope sends no num_ctx, so without this the packaged agents
+    would still truncate. Only fills in a default; never overrides a num_ctx
+    the coordinator already sent via the envelope.
+    """
+    opts = payload.get("options")
+    if not isinstance(opts, dict):
+        opts = {}
+    if "num_ctx" not in opts:
+        opts["num_ctx"] = _num_ctx_default()
+    payload["options"] = opts
+    return payload
+
+
+def _usage_from_response(resp: dict) -> Dict[str, int]:
+    """Extract Ollama token counts and map them to the coordinator's field
+    names. Ollama reports prompt_eval_count (input) and eval_count (output);
+    we forward both the raw names and tokens_in/tokens_out so the coordinator
+    earnings path (_reported_tokens / _provider_usage) sees them either way."""
+    meta: Dict[str, int] = {}
+    if not isinstance(resp, dict):
+        return meta
+    pin = resp.get("prompt_eval_count")
+    pout = resp.get("eval_count")
+    if isinstance(pin, int):
+        meta["tokens_in"] = pin
+        meta["prompt_eval_count"] = pin
+    if isinstance(pout, int):
+        meta["tokens_out"] = pout
+        meta["eval_count"] = pout
+    return meta
+
+
+def run_ollama_full(model: str, prompt: str, ollama_url: str = OLLAMA_URL,
+                    timeout: int = 120) -> tuple:
+    """Run inference and return (text, usage_meta).
+
+    Detects a JSON messages array → /api/chat, else → /api/generate. Strips
+    the coordinator options envelope from the first message and merges its
+    format/options/keep_alive into the Ollama payload, then guarantees a
+    num_ctx floor. usage_meta carries token counts for the completion report.
+    """
     if prompt.strip().startswith("["):
         try:
             messages = json.loads(prompt)
-            resp = http("POST", f"{ollama_url}/api/chat",
-                        {"model": model, "messages": messages, "stream": False}, timeout=timeout)
-            return resp.get("message", {}).get("content", "").strip()
+            messages, extras = _extract_opts_envelope(messages)
+            payload = {"model": model, "messages": messages, "stream": False}
+            _apply_opts_to_payload(payload, extras)
+            _ensure_num_ctx(payload)
+            resp = http("POST", f"{ollama_url}/api/chat", payload, timeout=timeout)
+            return resp.get("message", {}).get("content", "").strip(), _usage_from_response(resp)
         except Exception:
             pass
-    resp = http("POST", f"{ollama_url}/api/generate",
-                {"model": model, "prompt": prompt, "stream": False}, timeout=timeout)
-    return resp.get("response", "").strip()
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    _ensure_num_ctx(payload)
+    resp = http("POST", f"{ollama_url}/api/generate", payload, timeout=timeout)
+    return resp.get("response", "").strip(), _usage_from_response(resp)
+
+
+def run_ollama(model: str, prompt: str, ollama_url: str = OLLAMA_URL, timeout: int = 120) -> str:
+    """Run inference and return only the text (thin wrapper over run_ollama_full)."""
+    text, _ = run_ollama_full(model, prompt, ollama_url=ollama_url, timeout=timeout)
+    return text
 
 
 # ── Agent class ────────────────────────────────────────────────────────────────
@@ -393,8 +503,11 @@ class MyAIAgent:
 
     # ── Job handling ───────────────────────────────────────────────────────────
 
-    def _complete_job(self, job_id: str, result: str, success: bool = True):
+    def _complete_job(self, job_id: str, result: str, success: bool = True,
+                      meta: Optional[Dict[str, Any]] = None):
         body = {"success": success, "result": result}
+        if meta:
+            body.update(meta)
         if self.attest.available:
             body.update(self.attest.sign_envelope(self.agent_id))
         http("POST",
@@ -413,11 +526,14 @@ class MyAIAgent:
             return
 
         log.info(f"Job {job_id} | model={model} | {prompt[:60]}...")
-        result = run_ollama(model, prompt, self.ollama_url)
+        result, meta = run_ollama_full(model, prompt, self.ollama_url)
 
         if result:
-            log.info(f"Job {job_id} done ({len(result)} chars)")
-            self._complete_job(job_id, result, success=True)
+            log.info(
+                f"Job {job_id} done ({len(result)} chars, "
+                f"in={meta.get('tokens_in')}, out={meta.get('tokens_out')})"
+            )
+            self._complete_job(job_id, result, success=True, meta=meta)
         else:
             log.warning(f"Job {job_id} returned empty result")
             self._complete_job(job_id, "No response from model", success=False)
