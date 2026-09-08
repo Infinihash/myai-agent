@@ -4,6 +4,9 @@ Covers:
   * unsigned artifact rejected (no .sig / wrong-length sig)
   * tampered artifact rejected (valid sig for different content)
   * valid signed artifact accepted and atomically replaced
+  * backup created and rollback restores previous file
+  * downgrade refused by default; allowed when MYAI_ALLOW_DOWNGRADE=1
+  * integration tests call the REAL check_for_update() via allow_insecure_http
 
 Pure stdlib + cryptography (soft dep already used by attestation).
 Run with: MYAI_ADMIN_SECRET=ci-stub-not-real python -m pytest tests/test_update_sig.py
@@ -12,7 +15,9 @@ Run with: MYAI_ADMIN_SECRET=ci-stub-not-real python -m pytest tests/test_update_
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # src-layout: importable without install.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -21,6 +26,8 @@ from myai_agent import update  # noqa: E402
 from myai_agent.update import (  # noqa: E402
     _atomic_replace,
     _version_tuple,
+    check_for_update,
+    rollback,
     verify_artifact,
 )
 
@@ -92,24 +99,79 @@ class AtomicReplaceTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
             f.write(b"old content")
             path = f.name
+        bak = path + ".bak"
         try:
             _atomic_replace(path, b"new content")
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), b"new content")
         finally:
             os.unlink(path)
+            if os.path.exists(bak):
+                os.unlink(bak)
 
     def test_atomic_replace_no_tmp_left_on_success(self):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
             f.write(b"original")
             path = f.name
         directory = os.path.dirname(path)
+        bak = path + ".bak"
         before = set(os.listdir(directory))
         try:
             _atomic_replace(path, b"updated")
             after = set(os.listdir(directory))
             new_files = after - before
-            self.assertEqual(new_files, set(), f"leftover temp files: {new_files}")
+            # The only allowed new file is the .bak backup; no stray .tmp files.
+            expected_new = {os.path.basename(bak)}
+            stray = new_files - expected_new
+            self.assertEqual(stray, set(), f"stray temp files left: {stray}")
+        finally:
+            os.unlink(path)
+            if os.path.exists(bak):
+                os.unlink(bak)
+
+    def test_atomic_replace_creates_backup(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
+            f.write(b"original content")
+            path = f.name
+        bak = path + ".bak"
+        try:
+            _atomic_replace(path, b"new content")
+            self.assertTrue(os.path.exists(bak), ".bak file must be created")
+            with open(bak, "rb") as fh:
+                self.assertEqual(fh.read(), b"original content",
+                                 ".bak must contain the previous file contents")
+        finally:
+            os.unlink(path)
+            if os.path.exists(bak):
+                os.unlink(bak)
+
+    def test_rollback_restores_original(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
+            f.write(b"original content")
+            path = f.name
+        bak = path + ".bak"
+        try:
+            _atomic_replace(path, b"new content")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"new content")
+            result = rollback(path)
+            self.assertTrue(result, "rollback() must return True on success")
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"original content",
+                                 "rollback must restore original content")
+            self.assertFalse(os.path.exists(bak), ".bak must be removed after rollback")
+        finally:
+            os.unlink(path)
+            if os.path.exists(bak):
+                os.unlink(bak)
+
+    def test_rollback_returns_false_without_backup(self):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as f:
+            f.write(b"content")
+            path = f.name
+        try:
+            result = rollback(path)
+            self.assertFalse(result, "rollback() must return False when no .bak exists")
         finally:
             os.unlink(path)
 
@@ -126,94 +188,63 @@ class VersionTupleTests(unittest.TestCase):
         self.assertEqual(_version_tuple("not-a-version"), (0, 0, 0))
 
 
+def _make_handler(version, artifact_bytes, sig_bytes):
+    """Return an HTTPRequestHandler class serving fixed version/artifact/sig."""
+    import json
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            port = self.server.server_address[1]
+            if self.path == "/api/v1/agents/version":
+                body = json.dumps({
+                    "version": version,
+                    "url": f"http://127.0.0.1:{port}/dist/myai-agent.py",
+                }).encode()
+                self._send(200, body, "application/json")
+            elif self.path == "/dist/myai-agent.py":
+                self._send(200, artifact_bytes, "application/octet-stream")
+            elif self.path == "/dist/myai-agent.py.sig":
+                self._send(200, sig_bytes, "application/octet-stream")
+            else:
+                self._send(404, b"not found", "text/plain")
+
+        def _send(self, code, body, ct):
+            self.send_response(code)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
 class CheckForUpdateIntegrationTests(unittest.TestCase):
-    """Full check_for_update() flow using a fake HTTP coordinator."""
+    """Full check_for_update() flow using a local HTTP test server.
+
+    Uses the REAL check_for_update() via allow_insecure_http=True, which is
+    honoured only when MYAI_UPDATE_INSECURE_HTTP=1 AND the host is 127.0.0.1.
+    """
 
     def setUp(self):
-        import json
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
         self.priv, self.pub_hex = _gen_keypair()
         self.artifact = b"#!/usr/bin/env python3\n# v2.4.0\n"
         self.sig = _sign(self.priv, self.artifact)
 
-        artifact_bytes = self.artifact
-        sig_bytes = self.sig
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def do_GET(self):
-                if self.path == "/api/v1/agents/version":
-                    body = json.dumps({
-                        "version": "2.4.0",
-                        "url": f"http://127.0.0.1:{self.server.server_address[1]}/dist/myai-agent.py",
-                    }).encode()
-                    self._send(200, body, "application/json")
-                elif self.path == "/dist/myai-agent.py":
-                    self._send(200, artifact_bytes, "application/octet-stream")
-                elif self.path == "/dist/myai-agent.py.sig":
-                    self._send(200, sig_bytes, "application/octet-stream")
-                else:
-                    self._send(404, b"not found", "text/plain")
-
-            def _send(self, code, body, ct):
-                self.send_response(code)
-                self.send_header("Content-Type", ct)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        self.server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
     def _run(self, current_version="2.3.0", tamper_artifact=False, drop_sig=False,
-             wrong_key=False):
-        """Run check_for_update against the fake server, return (updated, dest_content)."""
-        import json
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        artifact_bytes = self.artifact
-        if tamper_artifact:
-            artifact_bytes = self.artifact + b"# tampered\n"
+             wrong_key=False, serve_version="2.4.0", allow_downgrade=False):
+        """Spin up a test HTTP server, call the real check_for_update(), return
+        (updated: bool, dest_content: bytes)."""
+        artifact_bytes = self.artifact + b"# tampered\n" if tamper_artifact else self.artifact
         sig_bytes = b"" if drop_sig else self.sig
+        pub_hex = self.pub_hex if not wrong_key else _gen_keypair()[1]
 
-        class PatchedHandler(BaseHTTPRequestHandler):
-            def log_message(self, *_):
-                pass
-
-            def do_GET(self):
-                if self.path == "/api/v1/agents/version":
-                    body = json.dumps({
-                        "version": "2.4.0",
-                        "url": f"http://127.0.0.1:{self.server.server_address[1]}/dist/myai-agent.py",
-                    }).encode()
-                    self._send(200, body, "application/json")
-                elif self.path == "/dist/myai-agent.py":
-                    self._send(200, artifact_bytes, "application/octet-stream")
-                elif self.path == "/dist/myai-agent.py.sig":
-                    self._send(200, sig_bytes, "application/octet-stream")
-                else:
-                    self._send(404, b"not found", "text/plain")
-
-            def _send(self, code, body, ct):
-                self.send_response(code)
-                self.send_header("Content-Type", ct)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        srv = HTTPServer(("127.0.0.1", 0), PatchedHandler)
+        srv = HTTPServer(
+            ("127.0.0.1", 0),
+            _make_handler(serve_version, artifact_bytes, sig_bytes),
+        )
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
@@ -221,43 +252,43 @@ class CheckForUpdateIntegrationTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as fh:
             fh.write(b"old agent")
             dest = fh.name
+        bak = dest + ".bak"
 
-        pub_hex = self.pub_hex if not wrong_key else _gen_keypair()[1]
-
-        # Temporarily allow http:// URLs for the test server by patching the check.
-        original_check_fn = update.check_for_update
-
-        def _patched_check(coordinator_url, current_version, current_path=None,
-                           pubkey_hex=update.RELEASE_PUBKEY_HEX):
-            # Replicate the real function but skip the https:// guard for tests.
-            import json as _j, urllib.request as _r
-            resp_raw = _r.urlopen(f"{coordinator_url}/api/v1/agents/version", timeout=10).read()
-            meta = _j.loads(resp_raw)
-            latest = meta.get("version", "")
-            artifact_url = meta.get("url", "")
-            if not latest or not artifact_url:
-                return False
-            if update._version_tuple(latest) <= update._version_tuple(current_version):
-                return False
-            try:
-                art, sig = update.download_signed_artifact(artifact_url)
-            except Exception:
-                return False
-            if not update.verify_artifact(art, sig, pubkey_hex=pubkey_hex):
-                return False
-            update._atomic_replace(current_path or dest, art)
-            return True
+        env_patch = {"MYAI_UPDATE_INSECURE_HTTP": "1"}
+        if allow_downgrade:
+            env_patch["MYAI_ALLOW_DOWNGRADE"] = "1"
+        saved_env = {}
+        for k, v in env_patch.items():
+            saved_env[k] = os.environ.get(k)
+            os.environ[k] = v
+        # Ensure downgrade flag is absent when not requested.
+        if not allow_downgrade and "MYAI_ALLOW_DOWNGRADE" in os.environ:
+            saved_env.setdefault("MYAI_ALLOW_DOWNGRADE", os.environ.pop("MYAI_ALLOW_DOWNGRADE"))
 
         try:
-            updated = _patched_check(base, current_version, current_path=dest,
-                                     pubkey_hex=pub_hex)
+            updated = check_for_update(
+                base, current_version,
+                current_path=dest,
+                pubkey_hex=pub_hex,
+                allow_insecure_http=True,
+            )
             with open(dest, "rb") as fh2:
                 content = fh2.read()
         finally:
+            for k, orig in saved_env.items():
+                if orig is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = orig
             srv.shutdown()
             srv.server_close()
             t.join(timeout=5)
-            os.unlink(dest)
+            if os.path.exists(bak):
+                os.unlink(bak)
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
 
         return updated, content
 
@@ -285,6 +316,60 @@ class CheckForUpdateIntegrationTests(unittest.TestCase):
         updated, content = self._run(wrong_key=True)
         self.assertFalse(updated, "sig from wrong key must be rejected")
         self.assertEqual(content, b"old agent")
+
+    def test_downgrade_refused_by_default(self):
+        # serve 2.4.0 but agent is already at 2.5.0 — must refuse without env var
+        updated, content = self._run(current_version="2.5.0", serve_version="2.4.0")
+        self.assertFalse(updated, "downgrade must be refused when MYAI_ALLOW_DOWNGRADE is unset")
+        self.assertEqual(content, b"old agent", "original file must be unchanged on refused downgrade")
+
+    def test_downgrade_allowed_with_env_var(self):
+        # same scenario but with MYAI_ALLOW_DOWNGRADE=1 — must succeed
+        updated, content = self._run(
+            current_version="2.5.0", serve_version="2.4.0", allow_downgrade=True
+        )
+        self.assertTrue(updated, "downgrade must be allowed when MYAI_ALLOW_DOWNGRADE=1")
+        self.assertEqual(content, self.artifact, "downgraded artifact must be written verbatim")
+
+    def test_insecure_http_refused_without_env_var(self):
+        # allow_insecure_http=True but MYAI_UPDATE_INSECURE_HTTP not set — must refuse
+        import json
+
+        srv = HTTPServer(
+            ("127.0.0.1", 0),
+            _make_handler("2.4.0", self.artifact, self.sig),
+        )
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as fh:
+            fh.write(b"old agent")
+            dest = fh.name
+        bak = dest + ".bak"
+
+        saved = os.environ.pop("MYAI_UPDATE_INSECURE_HTTP", None)
+        try:
+            updated = check_for_update(
+                base, "2.3.0",
+                current_path=dest,
+                pubkey_hex=self.pub_hex,
+                allow_insecure_http=True,  # env var absent → still refused
+            )
+        finally:
+            if saved is not None:
+                os.environ["MYAI_UPDATE_INSECURE_HTTP"] = saved
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=5)
+            if os.path.exists(bak):
+                os.unlink(bak)
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
+
+        self.assertFalse(updated, "HTTP must be refused when MYAI_UPDATE_INSECURE_HTTP is not set")
 
 
 if __name__ == "__main__":

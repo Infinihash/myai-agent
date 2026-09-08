@@ -19,6 +19,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 log = logging.getLogger("myai_agent.update")
 
@@ -91,20 +92,60 @@ def download_signed_artifact(artifact_url: str) -> Tuple[bytes, bytes]:
 
 
 def _atomic_replace(dest_path: str, content: bytes) -> None:
-    """Write content to dest_path atomically via a same-directory tempfile+rename."""
-    dest_dir = os.path.dirname(os.path.abspath(dest_path))
+    """Write content to dest_path atomically via a same-directory tempfile+rename.
+
+    Saves the previous file as <dest_path>.bak (fsync'd) before replacing so
+    that rollback() can restore it if the new version is broken.
+    """
+    dest_abs = os.path.abspath(dest_path)
+    dest_dir = os.path.dirname(dest_abs)
+    bak_path = dest_abs + ".bak"
+
+    if os.path.exists(dest_abs):
+        fd_bak, tmp_bak = tempfile.mkstemp(dir=dest_dir, suffix=".bak.tmp")
+        try:
+            with os.fdopen(fd_bak, "wb") as bak_fh:
+                with open(dest_abs, "rb") as src:
+                    bak_fh.write(src.read())
+                bak_fh.flush()
+                os.fsync(bak_fh.fileno())
+            os.replace(tmp_bak, bak_path)
+        except Exception:
+            try:
+                os.unlink(tmp_bak)
+            except OSError:
+                pass
+            raise
+
     fd, tmp = tempfile.mkstemp(dir=dest_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(content)
-        shutil.copystat(dest_path, tmp)
-        os.replace(tmp, dest_path)
+        if os.path.exists(dest_abs):
+            shutil.copystat(dest_abs, tmp)
+        os.replace(tmp, dest_abs)
     except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+
+def rollback(path: str) -> bool:
+    """Restore path from <path>.bak if it exists. Returns True on success."""
+    path_abs = os.path.abspath(path)
+    bak_path = path_abs + ".bak"
+    if not os.path.exists(bak_path):
+        log.warning("rollback: no backup at %s", bak_path)
+        return False
+    try:
+        os.replace(bak_path, path_abs)
+        log.info("rollback: restored %s from backup", path_abs)
+        return True
+    except Exception as exc:
+        log.error("rollback: failed to restore %s: %s", path_abs, exc)
+        return False
 
 
 def _version_tuple(v: str) -> tuple:
@@ -119,12 +160,16 @@ def check_for_update(
     current_version: str,
     current_path: Optional[str] = None,
     pubkey_hex: str = RELEASE_PUBKEY_HEX,
+    allow_insecure_http: bool = False,
 ) -> bool:
     """Check the coordinator for a newer agent version and apply it if signed.
 
     Returns True if the agent was updated (caller should exec the new binary).
     Returns False if already up-to-date, the new version is unsigned/tampered,
     or any network/verification error occurs (fail-closed).
+
+    allow_insecure_http: test-only escape hatch; only honoured when
+    MYAI_UPDATE_INSECURE_HTTP=1 is set AND the artifact host is 127.0.0.1.
     """
     try:
         import json as _json
@@ -143,11 +188,34 @@ def check_for_update(
         log.debug("update: no version/url in coordinator response")
         return False
 
-    if _version_tuple(latest) <= _version_tuple(current_version):
-        log.debug("update: already at v%s (latest v%s)", current_version, latest)
+    latest_t = _version_tuple(latest)
+    current_t = _version_tuple(current_version)
+
+    if latest_t == current_t:
+        log.debug("update: already at v%s", current_version)
         return False
 
-    if not url.startswith("https://"):
+    if latest_t < current_t:
+        if os.environ.get("MYAI_ALLOW_DOWNGRADE") != "1":
+            log.warning(
+                "update: v%s is older than current v%s — downgrade refused "
+                "(set MYAI_ALLOW_DOWNGRADE=1 to allow)",
+                latest, current_version,
+            )
+            return False
+        log.warning(
+            "update: MYAI_ALLOW_DOWNGRADE=1 — allowing downgrade from v%s to v%s",
+            current_version, latest,
+        )
+
+    parsed_url = urlparse(url)
+    _insecure_ok = (
+        allow_insecure_http
+        and os.environ.get("MYAI_UPDATE_INSECURE_HTTP") == "1"
+        and parsed_url.hostname == "127.0.0.1"
+        and parsed_url.scheme == "http"
+    )
+    if not url.startswith("https://") and not _insecure_ok:
         log.error("update: artifact URL must be HTTPS, got %r — refusing", url[:64])
         return False
 
