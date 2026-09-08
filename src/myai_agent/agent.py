@@ -63,6 +63,14 @@ MYAI_WS_URL = _env("MYAI_WS_URL", "")
 # No-op (empty shards list) when not set.
 MYAI_SHARD_ROOT = _env("MYAI_SHARD_ROOT", "")
 
+# MYAI_PROBE_PORT: optional UDP port for RTT pod-clustering probes. When set,
+# the agent runs a UDP echo server and advertises probe_port in register/hello.
+MYAI_PROBE_PORT = 0
+try:
+    MYAI_PROBE_PORT = int(os.environ.get("MYAI_PROBE_PORT", "0") or "0")
+except ValueError:
+    MYAI_PROBE_PORT = 0
+
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
 
@@ -219,6 +227,31 @@ def _shard_ids() -> List[str]:
         )
     except OSError:
         return []
+
+
+# ── UDP RTT probe echo (opt-in via MYAI_PROBE_PORT) ───────────────────────────
+
+def _start_probe_echo() -> None:
+    """Bind UDP :MYAI_PROBE_PORT and echo datagrams back (best-effort daemon)."""
+    if not MYAI_PROBE_PORT:
+        return
+
+    def _serve():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", MYAI_PROBE_PORT))
+            log.info(f"UDP RTT echo listening on :{MYAI_PROBE_PORT}")
+            while True:
+                data, addr = s.recvfrom(64)
+                try:
+                    s.sendto(data, addr)
+                except OSError:
+                    pass
+        except Exception as e:
+            log.warning(f"UDP RTT echo server failed: {e}")
+
+    threading.Thread(target=_serve, daemon=True).start()
 
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
@@ -506,6 +539,8 @@ class MyAIAgent:
             "wallet_address":     self.wallet,
             "price_per_hour_myai": 1.0,
         }
+        if MYAI_PROBE_PORT:
+            payload["probe_port"] = MYAI_PROBE_PORT
         # v3-C attestation envelope
         if self.attest.available:
             payload["attestation_pubkey_b64"] = self.attest.pubkey_b64
@@ -668,6 +703,22 @@ class MyAIAgent:
 
     # ── WebSocket dispatch ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_job(msg: dict) -> dict:
+        """Extract the job dict from a job.assign message.
+
+        Supports both flat (fields at top level) and nested (fields under 'data')
+        wire shapes.
+        """
+        job = msg.get("data") or msg
+        if "job_id" not in job:
+            job = {
+                "job_id": msg.get("job_id", ""),
+                "model":  msg.get("model", "llama3.2"),
+                "prompt": msg.get("prompt", ""),
+            }
+        return job
+
     def _build_ws_url(self) -> str:
         """Build the /ws/agent URL with HMAC query-string auth."""
         base = _ws_base_url(self.coordinator_url)
@@ -692,6 +743,8 @@ class MyAIAgent:
         }
         if shards:
             payload["shards"] = shards
+        if MYAI_PROBE_PORT:
+            payload["probe_port"] = MYAI_PROBE_PORT
         return payload
 
     def _ws_loop(self):
@@ -730,8 +783,8 @@ class MyAIAgent:
                     else:
                         log.warning(f"[WS] Unexpected first message: {welcome}")
 
-                # Main receive loop
-                ws.settimeout(35)   # slightly longer than heartbeat interval
+                # Main receive loop — timeout slightly longer than heartbeat interval
+                ws.settimeout(self.heartbeat_interval + 5)
                 while self._running:
                     try:
                         raw = ws.recv()
@@ -756,15 +809,7 @@ class MyAIAgent:
                     msg_type = msg.get("type", "")
 
                     if msg_type == "job.assign":
-                        # Support both flat and nested (_payload-compatible) wire shape.
-                        job = msg.get("data") or msg
-                        # Ensure required keys are present (flat shape has them at top level)
-                        if "job_id" not in job:
-                            job = {
-                                "job_id": msg.get("job_id", ""),
-                                "model":  msg.get("model", "llama3.2"),
-                                "prompt": msg.get("prompt", ""),
-                            }
+                        job = self._extract_job(msg)
                         # Process in a thread so the WS loop stays responsive
                         t = threading.Thread(
                             target=self._process_job_ws, args=(ws, job), daemon=True
@@ -827,6 +872,8 @@ class MyAIAgent:
         shards = _shard_ids()
         if shards:
             log.info(f"  Shards      : {len(shards)} under {MYAI_SHARD_ROOT}")
+
+        _start_probe_echo()
 
         # Pre-pull required models before registering
         self.ensure_models()

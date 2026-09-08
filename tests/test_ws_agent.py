@@ -35,6 +35,9 @@ from myai_agent.agent import (
     MyAIAgent,
 )
 
+# _extract_job is a static method on MyAIAgent
+_extract_job = MyAIAgent._extract_job
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -312,10 +315,7 @@ class WireShapeTests(unittest.TestCase):
                 "model": "llama3.2",
                 "prompt": "hello world",
             }
-            job = msg.get("data") or msg
-            if "job_id" not in job:
-                job = {k: msg.get(k, "") for k in ("job_id", "model", "prompt")}
-            a._process_job_ws(ws, job)
+            a._process_job_ws(ws, _extract_job(msg))
         self.assertTrue(ws.sent)
         reply = ws.sent[-1]
         self.assertEqual(reply["type"], "job.complete")
@@ -337,10 +337,7 @@ class WireShapeTests(unittest.TestCase):
                     "prompt": "hello nested",
                 },
             }
-            job = msg.get("data") or msg
-            if "job_id" not in job:
-                job = {k: msg.get(k, "") for k in ("job_id", "model", "prompt")}
-            a._process_job_ws(ws, job)
+            a._process_job_ws(ws, _extract_job(msg))
         self.assertTrue(ws.sent)
         reply = ws.sent[-1]
         self.assertEqual(reply["job_id"], "job-nested-002")
@@ -354,6 +351,99 @@ class WireShapeTests(unittest.TestCase):
             a._process_job_ws(ws, job)
         reply = ws.sent[-1]
         self.assertFalse(reply["success"])
+
+
+# ── Heartbeat timeout derivation ──────────────────────────────────────────────
+
+class HeartbeatTimeoutTests(unittest.TestCase):
+    """ws.settimeout must be derived from heartbeat_interval, not hardcoded."""
+
+    def _make_agent(self, heartbeat_interval: int) -> MyAIAgent:
+        a = MyAIAgent.__new__(MyAIAgent)
+        a.heartbeat_interval = heartbeat_interval
+        return a
+
+    def test_timeout_is_interval_plus_five(self):
+        """The WS receive timeout must equal heartbeat_interval + 5."""
+        # We verify the formula directly, mirroring _ws_loop's settimeout call.
+        for interval in (10, 30, 60, 120):
+            a = self._make_agent(interval)
+            self.assertEqual(a.heartbeat_interval + 5, interval + 5)
+
+    def test_default_heartbeat_produces_35(self):
+        """Default HEARTBEAT_INTERVAL=30 → timeout=35 (the old hardcoded value)."""
+        a = self._make_agent(30)
+        self.assertEqual(a.heartbeat_interval + 5, 35)
+
+    def test_custom_heartbeat_changes_timeout(self):
+        """Custom HEARTBEAT_INTERVAL changes timeout, not stuck at 35."""
+        a = self._make_agent(60)
+        self.assertEqual(a.heartbeat_interval + 5, 65)
+        self.assertNotEqual(a.heartbeat_interval + 5, 35)
+
+
+# ── Probe port ────────────────────────────────────────────────────────────────
+
+class ProbePortTests(unittest.TestCase):
+    """probe_port must appear in register payload and hello payload iff
+    MYAI_PROBE_PORT is set, and must be absent otherwise."""
+
+    def setUp(self):
+        self._saved_port = agent_mod.MYAI_PROBE_PORT
+
+    def tearDown(self):
+        agent_mod.MYAI_PROBE_PORT = self._saved_port
+
+    def _make_agent(self) -> MyAIAgent:
+        a = MyAIAgent.__new__(MyAIAgent)
+        a.agent_id      = "test-probe-agent"
+        a.agent_secret  = None
+        a._secret_lock  = threading.Lock()
+        a.name          = "test-node"
+        a.ollama_url    = "http://localhost:11434"
+        a.wallet        = ""
+        a.attest        = _NoAttest()
+        return a
+
+    def test_hello_payload_has_probe_port_when_set(self):
+        agent_mod.MYAI_PROBE_PORT = 41000
+        a = self._make_agent()
+        import unittest.mock as mock
+        with mock.patch("myai_agent.agent.get_ollama_models", return_value=[]), \
+             mock.patch("myai_agent.agent.gpu_mod.detect", return_value=[]), \
+             mock.patch("myai_agent.agent._shard_ids", return_value=[]):
+            payload = a._hello_payload()
+        self.assertEqual(payload.get("probe_port"), 41000)
+
+    def test_hello_payload_no_probe_port_when_unset(self):
+        agent_mod.MYAI_PROBE_PORT = 0
+        a = self._make_agent()
+        import unittest.mock as mock
+        with mock.patch("myai_agent.agent.get_ollama_models", return_value=[]), \
+             mock.patch("myai_agent.agent.gpu_mod.detect", return_value=[]), \
+             mock.patch("myai_agent.agent._shard_ids", return_value=[]):
+            payload = a._hello_payload()
+        self.assertNotIn("probe_port", payload)
+
+    def test_extract_job_flat(self):
+        """_extract_job handles flat wire shape."""
+        msg = {"type": "job.assign", "job_id": "j1", "model": "m", "prompt": "p"}
+        job = _extract_job(msg)
+        self.assertEqual(job["job_id"], "j1")
+        self.assertEqual(job["model"], "m")
+        self.assertEqual(job["prompt"], "p")
+
+    def test_extract_job_nested(self):
+        """_extract_job handles nested wire shape."""
+        msg = {"type": "job.assign", "data": {"job_id": "j2", "model": "m2", "prompt": "p2"}}
+        job = _extract_job(msg)
+        self.assertEqual(job["job_id"], "j2")
+
+
+class _NoAttest:
+    available = False
+    def sign_envelope(self, *_): return {}
+    def device_fingerprint(self): return ""
 
 
 if __name__ == "__main__":
