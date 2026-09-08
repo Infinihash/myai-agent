@@ -211,6 +211,72 @@ def cmd_run_job(args):
         sys.exit(1)
 
 
+def cmd_needle(args):
+    """Needle-in-haystack truncation regression test.
+
+    Sends a ~6 k-token prompt containing a unique needle string through the
+    local inference path (Ollama) and asserts the needle appears in the
+    response.  Fails with exit code 1 if the needle is missing — which
+    indicates prompt truncation (the old packaged agent bug).
+
+    The test is intentionally self-contained: it does NOT connect to the
+    coordinator or require a registered agent.  Set MYAI_NUM_CTX to at least
+    8192 (the default) to ensure the context window is large enough.
+    """
+    _setup_logging(args.verbose)
+    import uuid as _uuid
+    from .agent import run_ollama_full
+
+    ollama = args.ollama or os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    model  = args.model  or os.environ.get("NEEDLE_MODEL", "llama3.2")
+
+    # Build a ~6 k-token prompt: filler (≈5 k tokens) + needle + tail (≈1 k tokens)
+    needle_id = _uuid.uuid4().hex[:16]
+    needle    = f"NEEDLE-{needle_id}"
+
+    # ~4 chars per token on average; target 6 k tokens total
+    filler_tokens = 5000
+    tail_tokens   = 1000
+    filler = ("The quick brown fox jumps over the lazy dog. " * 120).strip()
+    # Repeat to reach target length
+    filler_block = (filler + " ") * (filler_tokens * 4 // len(filler) + 1)
+    filler_block = filler_block[: filler_tokens * 4]
+
+    tail_block = ("Paris is the capital of France. " * 80).strip()
+    tail_block = (tail_block + " ") * (tail_tokens * 4 // len(tail_block) + 1)
+    tail_block = tail_block[: tail_tokens * 4]
+
+    prompt = (
+        f"{filler_block}\n\n"
+        f"The secret code is: {needle}\n\n"
+        f"{tail_block}\n\n"
+        f"What is the secret code mentioned in the text above? "
+        f"Reply with only the secret code, nothing else."
+    )
+
+    token_estimate = len(prompt) // 4
+    print(f"\nNeedle test: model={model}, ollama={ollama}")
+    print(f"  Needle    : {needle}")
+    print(f"  Prompt    : ~{token_estimate} tokens ({len(prompt)} chars)")
+    print()
+
+    result, meta = run_ollama_full(model, prompt, ollama_url=ollama, timeout=300)
+
+    tokens_in  = meta.get("tokens_in", "?")
+    tokens_out = meta.get("tokens_out", "?")
+    print(f"  Response  : {result[:200]!r}")
+    print(f"  Tokens    : in={tokens_in}, out={tokens_out}")
+    print()
+
+    if needle in result:
+        print(f"  PASS — needle '{needle}' found in response")
+    else:
+        print(f"  FAIL — needle '{needle}' NOT found in response")
+        print("  This indicates prompt truncation (context window too small).")
+        print("  Check MYAI_NUM_CTX — must be >= 8192 for 6 k-token prompts.")
+        sys.exit(1)
+
+
 
 
 # ── v3-C attestation commands ─────────────────────────────────────────────────
@@ -332,6 +398,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--ollama", metavar="URL")
     p_run.add_argument("-v", "--verbose", action="store_true")
     p_run.set_defaults(func=cmd_run_job)
+
+    # ── needle ─────────────────────────────────────────────────────────────────
+    p_needle = sub.add_parser(
+        "needle",
+        help="Truncation regression test: send a 6k-token prompt with a needle and assert it is found",
+    )
+    p_needle.add_argument("--model",  metavar="MODEL", default="",
+                          help="Ollama model (default: llama3.2 or $NEEDLE_MODEL)")
+    p_needle.add_argument("--ollama", metavar="URL",
+                          help="Ollama URL (default: http://localhost:11434 or $OLLAMA_URL)")
+    p_needle.add_argument("-v", "--verbose", action="store_true")
+    p_needle.set_defaults(func=cmd_needle)
 
     return parser
 

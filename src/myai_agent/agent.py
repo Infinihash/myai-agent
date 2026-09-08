@@ -30,7 +30,7 @@ from .config import get_config_dir
 
 log = logging.getLogger("myai_agent")
 
-VERSION = "2.3.0"  # T10694: coordinator options envelope (num_ctx/format/keep_alive)
+VERSION = "2.4.0"  # T10768: /ws/agent WS dispatch + bundle scripts + needle test
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -53,6 +53,23 @@ REQUIRED_MODELS_RAW = _env("REQUIRED_MODELS", "bonsai-8b:latest")
 REQUIRED_MODELS: List[str] = [
     m.strip() for m in REQUIRED_MODELS_RAW.split(",") if m.strip()
 ]
+
+# MYAI_WS_URL: override the WebSocket base URL independently of COORDINATOR_URL.
+# When unset, the WS URL is derived from COORDINATOR_URL by swapping the scheme.
+# Example: MYAI_WS_URL=ws://localhost:8000
+MYAI_WS_URL = _env("MYAI_WS_URL", "")
+
+# MYAI_SHARD_ROOT: directory containing shard files advertised in agent.hello.
+# No-op (empty shards list) when not set.
+MYAI_SHARD_ROOT = _env("MYAI_SHARD_ROOT", "")
+
+# MYAI_PROBE_PORT: optional UDP port for RTT pod-clustering probes. When set,
+# the agent runs a UDP echo server and advertises probe_port in register/hello.
+MYAI_PROBE_PORT = 0
+try:
+    MYAI_PROBE_PORT = int(os.environ.get("MYAI_PROBE_PORT", "0") or "0")
+except ValueError:
+    MYAI_PROBE_PORT = 0
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
@@ -136,22 +153,105 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 
+def _hmac_triple(agent_id: str, secret_b64: str) -> Dict[str, str]:
+    """Compute HMAC triple (ts, nonce, sig) from the agent secret.
+
+    Returns a dict with keys ts, nonce, sig — suitable for either HTTP headers
+    (X-Agent-Ts / X-Agent-Nonce / X-Agent-Sig) or WS query-string params.
+    sig = base64url-no-pad( HMAC_SHA256(raw_secret, "{agent_id}|{ts}|{nonce}") )
+    """
+    secret = _b64url_decode(secret_b64)
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    msg = f"{agent_id}|{ts}|{nonce}".encode()
+    sig = base64.urlsafe_b64encode(
+        hmac.new(secret, msg, hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    return {"ts": ts, "nonce": nonce, "sig": sig}
+
+
 def agent_auth_headers(agent_id: str, secret_b64: Optional[str]) -> Dict[str, str]:
     """HMAC-triple headers for agent-plane calls; {} when no secret is held."""
     if not secret_b64:
         return {}
     try:
-        secret = _b64url_decode(secret_b64)
-        ts = str(int(time.time()))
-        nonce = secrets.token_hex(16)
-        msg = f"{agent_id}|{ts}|{nonce}".encode()
-        sig = base64.urlsafe_b64encode(
-            hmac.new(secret, msg, hashlib.sha256).digest()
-        ).rstrip(b"=").decode()
-        return {"X-Agent-Ts": ts, "X-Agent-Nonce": nonce, "X-Agent-Sig": sig}
+        triple = _hmac_triple(agent_id, secret_b64)
+        return {
+            "X-Agent-Ts":    triple["ts"],
+            "X-Agent-Nonce": triple["nonce"],
+            "X-Agent-Sig":   triple["sig"],
+        }
     except Exception as e:
         log.debug("agent_auth_headers failed: %s", e)
         return {}
+
+
+def _ws_auth_qs(agent_id: str, secret_b64: Optional[str]) -> str:
+    """Return the HMAC query-string suffix for the /ws/agent URL.
+
+    Returns "&ts=...&nonce=...&sig=..." (prefixed with &) so callers can
+    safely append it to a URL that already has other params.  Empty string
+    when no secret is held.
+    """
+    if not secret_b64:
+        return ""
+    try:
+        triple = _hmac_triple(agent_id, secret_b64)
+        return f"&ts={triple['ts']}&nonce={triple['nonce']}&sig={triple['sig']}"
+    except Exception as e:
+        log.debug("_ws_auth_qs failed: %s", e)
+        return ""
+
+
+def _ws_base_url(coordinator_url: str) -> str:
+    """Derive the WebSocket base URL.
+
+    Respects the MYAI_WS_URL env-var override; otherwise swaps the HTTP scheme.
+    """
+    if MYAI_WS_URL:
+        return MYAI_WS_URL.rstrip("/")
+    return coordinator_url.replace("https://", "wss://").replace("http://", "ws://")
+
+
+# ── Shard advertisement ────────────────────────────────────────────────────────
+
+def _shard_ids() -> List[str]:
+    """List shard IDs under MYAI_SHARD_ROOT.  No-op (empty list) when unset."""
+    root = MYAI_SHARD_ROOT
+    if not root or not os.path.isdir(root):
+        return []
+    try:
+        return sorted(
+            e.name for e in os.scandir(root)
+            if e.is_file() and not e.name.startswith(".")
+        )
+    except OSError:
+        return []
+
+
+# ── UDP RTT probe echo (opt-in via MYAI_PROBE_PORT) ───────────────────────────
+
+def _start_probe_echo() -> None:
+    """Bind UDP :MYAI_PROBE_PORT and echo datagrams back (best-effort daemon)."""
+    if not MYAI_PROBE_PORT:
+        return
+
+    def _serve():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", MYAI_PROBE_PORT))
+            log.info(f"UDP RTT echo listening on :{MYAI_PROBE_PORT}")
+            while True:
+                data, addr = s.recvfrom(64)
+                try:
+                    s.sendto(data, addr)
+                except OSError:
+                    pass
+        except Exception as e:
+            log.warning(f"UDP RTT echo server failed: {e}")
+
+    threading.Thread(target=_serve, daemon=True).start()
 
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
@@ -398,6 +498,19 @@ class MyAIAgent:
         self.attest             = Attestation(
             os.path.join(get_config_dir(), ".attest-key.pem")
         )
+        # Lock protecting self.agent_secret so the WS reconnect loop always
+        # reads the most-recently-issued secret (secret-cache fix).
+        self._secret_lock = threading.Lock()
+
+    # ── Secret cache (thread-safe) ─────────────────────────────────────────────
+
+    def _get_secret(self) -> Optional[str]:
+        with self._secret_lock:
+            return self.agent_secret
+
+    def _set_secret(self, secret_b64: str) -> None:
+        with self._secret_lock:
+            self.agent_secret = secret_b64
 
     # ── Model Pre-pull ─────────────────────────────────────────────────────────
 
@@ -426,6 +539,8 @@ class MyAIAgent:
             "wallet_address":     self.wallet,
             "price_per_hour_myai": 1.0,
         }
+        if MYAI_PROBE_PORT:
+            payload["probe_port"] = MYAI_PROBE_PORT
         # v3-C attestation envelope
         if self.attest.available:
             payload["attestation_pubkey_b64"] = self.attest.pubkey_b64
@@ -469,7 +584,7 @@ class MyAIAgent:
             _data = resp.get("data", {}) or {}
             _new_secret = _data.get("agent_secret_b64")
             if _new_secret:
-                self.agent_secret = _new_secret
+                self._set_secret(_new_secret)
                 save_agent_secret(_new_secret)
                 log.info("agent_secret issued + persisted (HMAC auth enabled)")
             log.info(f"Registered as '{self.name}' (id={self.agent_id})")
@@ -494,7 +609,7 @@ class MyAIAgent:
             resp = http("POST",
                         f"{self.coordinator_url}/api/v1/agents/{self.agent_id}/heartbeat",
                         body,
-                        extra_headers=agent_auth_headers(self.agent_id, self.agent_secret))
+                        extra_headers=agent_auth_headers(self.agent_id, self._get_secret()))
             if resp.get("success"):
                 log.debug("Heartbeat ok")
             else:
@@ -513,7 +628,27 @@ class MyAIAgent:
         http("POST",
              f"{self.coordinator_url}/api/v1/agents/{self.agent_id}/jobs/{job_id}/complete",
              body,
-             extra_headers=agent_auth_headers(self.agent_id, self.agent_secret))
+             extra_headers=agent_auth_headers(self.agent_id, self._get_secret()))
+
+    def _complete_job_ws(self, ws, job_id: str, result: str, success: bool = True,
+                         meta: Optional[Dict[str, Any]] = None):
+        """Send job.complete back over an open WebSocket connection."""
+        msg: Dict[str, Any] = {
+            "type":     "job.complete",
+            "job_id":   job_id,
+            "success":  success,
+            "content":  result,
+        }
+        if meta:
+            msg["latency_ms"]  = meta.get("latency_ms", 0)
+            msg["eval_count"]  = meta.get("tokens_out") or meta.get("eval_count", 0)
+            msg["model"]       = meta.get("model", "")
+        if not success:
+            msg["error"] = result
+        try:
+            ws.send(json.dumps(msg))
+        except Exception as e:
+            log.warning(f"[WS] Failed to send job.complete for {job_id[:12]}: {e}")
 
     def _process_job(self, job: dict):
         job_id = job.get("job_id", "unknown")
@@ -538,6 +673,175 @@ class MyAIAgent:
             log.warning(f"Job {job_id} returned empty result")
             self._complete_job(job_id, "No response from model", success=False)
 
+    def _process_job_ws(self, ws, job: dict):
+        """Handle a job dispatched over WebSocket — result goes back on the same WS."""
+        job_id = job.get("job_id", "unknown")
+        model  = job.get("model", "llama3.2")
+        prompt = job.get("prompt", "")
+
+        if not prompt:
+            log.warning(f"[WS] Job {job_id} has empty prompt — skipping")
+            self._complete_job_ws(ws, job_id, "", success=False)
+            return
+
+        t0 = time.time()
+        log.info(f"[WS] Job {job_id[:12]} | model={model} | {prompt[:60]}...")
+        result, meta = run_ollama_full(model, prompt, self.ollama_url)
+        meta["latency_ms"] = int((time.time() - t0) * 1000)
+        meta["model"] = model
+
+        if result:
+            log.info(
+                f"[WS] Job {job_id[:12]} done ({len(result)} chars, "
+                f"in={meta.get('tokens_in')}, out={meta.get('tokens_out')}, "
+                f"{meta['latency_ms']}ms)"
+            )
+            self._complete_job_ws(ws, job_id, result, success=True, meta=meta)
+        else:
+            log.warning(f"[WS] Job {job_id[:12]} returned empty result")
+            self._complete_job_ws(ws, job_id, "No response from model", success=False, meta=meta)
+
+    # ── WebSocket dispatch ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_job(msg: dict) -> dict:
+        """Extract the job dict from a job.assign message.
+
+        Supports both flat (fields at top level) and nested (fields under 'data')
+        wire shapes.
+        """
+        job = msg.get("data") or msg
+        if "job_id" not in job:
+            job = {
+                "job_id": msg.get("job_id", ""),
+                "model":  msg.get("model", "llama3.2"),
+                "prompt": msg.get("prompt", ""),
+            }
+        return job
+
+    def _build_ws_url(self) -> str:
+        """Build the /ws/agent URL with HMAC query-string auth."""
+        base = _ws_base_url(self.coordinator_url)
+        url = f"{base}/ws/agent?agent_id={self.agent_id}"
+        url += _ws_auth_qs(self.agent_id, self._get_secret())
+        return url
+
+    def _hello_payload(self) -> dict:
+        """agent.hello message — sent once per WS connection."""
+        models   = get_ollama_models(self.ollama_url)
+        gpus     = gpu_mod.detect()
+        shards   = _shard_ids()
+        payload: Dict[str, Any] = {
+            "type":    "agent.hello",
+            "version": VERSION,
+            "name":    self.name,
+            "models":  models,
+            "hardware": {
+                "platform": platform.system(),
+                "gpus":     gpus,
+            },
+        }
+        if shards:
+            payload["shards"] = shards
+        if MYAI_PROBE_PORT:
+            payload["probe_port"] = MYAI_PROBE_PORT
+        return payload
+
+    def _ws_loop(self):
+        """Connect to /ws/agent and handle job dispatch via WebSocket.
+
+        Falls back to HTTP polling when websocket-client is unavailable.
+        Reconnects with exponential backoff (max 60s + jitter).
+        """
+        try:
+            import websocket as _ws_lib
+        except ImportError:
+            log.info("[WS] websocket-client not installed — WebSocket dispatch disabled")
+            log.info("[WS] Install with: pip install websocket-client")
+            return
+
+        import random as _random
+        reconnect_delay = 1.0
+
+        while self._running:
+            ws_url = self._build_ws_url()
+            log.info(f"[WS] Connecting to {ws_url.split('?')[0]}...")
+            try:
+                ws = _ws_lib.create_connection(ws_url, timeout=15)
+
+                # Send agent.hello
+                ws.send(json.dumps(self._hello_payload()))
+
+                # Expect welcome (or registered for older coordinators)
+                welcome_raw = ws.recv()
+                if welcome_raw:
+                    welcome = json.loads(welcome_raw)
+                    mtype = welcome.get("type", "")
+                    if mtype in ("welcome", "registered"):
+                        log.info("[WS] Connected and welcomed by coordinator")
+                        reconnect_delay = 1.0  # reset backoff on successful connect
+                    else:
+                        log.warning(f"[WS] Unexpected first message: {welcome}")
+
+                # Main receive loop — timeout slightly longer than heartbeat interval
+                ws.settimeout(self.heartbeat_interval + 5)
+                while self._running:
+                    try:
+                        raw = ws.recv()
+                    except _ws_lib.WebSocketTimeoutException:
+                        # Send heartbeat when idle
+                        ws.send(json.dumps({
+                            "type":   "heartbeat",
+                            "models": get_ollama_models(self.ollama_url),
+                        }))
+                        continue
+                    except _ws_lib.WebSocketConnectionClosedException:
+                        log.warning("[WS] Connection closed by coordinator")
+                        break
+
+                    if not raw:
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = msg.get("type", "")
+
+                    if msg_type == "job.assign":
+                        job = self._extract_job(msg)
+                        # Process in a thread so the WS loop stays responsive
+                        t = threading.Thread(
+                            target=self._process_job_ws, args=(ws, job), daemon=True
+                        )
+                        t.start()
+
+                    elif msg_type in ("heartbeat_ack", "ack", "pong"):
+                        pass
+
+                    elif msg_type == "welcome":
+                        pass  # coordinator may re-send after hello
+
+                    else:
+                        log.debug(f"[WS] Unhandled message type: {msg_type}")
+
+                ws.close()
+
+            except _ws_lib.WebSocketConnectionClosedException:
+                log.warning("[WS] Connection refused or immediately closed")
+            except Exception as e:
+                log.warning(f"[WS] Connection error: {e}")
+
+            if not self._running:
+                break
+
+            # Exponential backoff with ±25% jitter (max 60 s)
+            jitter = _random.uniform(-0.25, 0.25) * reconnect_delay
+            wait = min(reconnect_delay + jitter, 60.0)
+            log.info(f"[WS] Reconnecting in {wait:.1f}s...")
+            time.sleep(max(1.0, wait))
+            reconnect_delay = min(reconnect_delay * 2, 60.0)
+
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     def _poll_loop(self):
@@ -547,7 +851,7 @@ class MyAIAgent:
                 resp = http("GET",
                             f"{self.coordinator_url}/api/v1/agents/{self.agent_id}/jobs/pending",
                             timeout=10,
-                            extra_headers=agent_auth_headers(self.agent_id, self.agent_secret))
+                            extra_headers=agent_auth_headers(self.agent_id, self._get_secret()))
                 for job in resp.get("data", {}).get("jobs", []):
                     self._process_job(job)
             except Exception as e:
@@ -564,6 +868,12 @@ class MyAIAgent:
             log.info(f"  Attestation : ECDSA P-256 pubkey {self.attest.pubkey_b64[:24]}...")
         else:
             log.info(f"  Attestation : DISABLED (set MYAI_DISABLE_ATTESTATION=0 or install `cryptography`)")
+
+        shards = _shard_ids()
+        if shards:
+            log.info(f"  Shards      : {len(shards)} under {MYAI_SHARD_ROOT}")
+
+        _start_probe_echo()
 
         # Pre-pull required models before registering
         self.ensure_models()
@@ -582,6 +892,11 @@ class MyAIAgent:
 
         hb = threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat")
         hb.start()
+
+        # WebSocket dispatch thread (falls back gracefully if websocket-client missing)
+        ws_thread = threading.Thread(target=self._ws_loop, daemon=True, name="ws-dispatch")
+        ws_thread.start()
+        log.info("[WS] WebSocket dispatch thread started (HTTP polling as fallback)")
 
         try:
             self._poll_loop()
