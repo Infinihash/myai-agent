@@ -1,0 +1,131 @@
+name: Bundle & Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # needed to upload release assets
+
+jobs:
+  # ── Tests (all platforms) ─────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test deps
+        run: pip install pytest
+      - name: Run tests
+        run: make test
+        env:
+          MYAI_ADMIN_SECRET: ci-stub-not-real
+
+  # ── macOS arm64 bundle ────────────────────────────────────────────────────────
+  bundle-mac:
+    name: Bundle macOS (arm64)
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build macOS bundle
+        run: make bundle-mac
+      - name: Determine version
+        id: ver
+        run: |
+          echo "version=$(python3 -c "import sys; sys.path.insert(0,'src'); from myai_agent import __version__; print(__version__)")" >> "$GITHUB_OUTPUT"
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myai-agent-${{ steps.ver.outputs.version }}-mac-arm64
+          path: |
+            dist/mac/myai-agent-${{ steps.ver.outputs.version }}-mac-arm64
+            dist/mac/myai-agent-${{ steps.ver.outputs.version }}-mac-arm64.sha256
+          retention-days: 7
+
+  # ── Windows amd64 bundle ──────────────────────────────────────────────────────
+  bundle-win:
+    name: Bundle Windows (amd64)
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build Windows bundle
+        run: make bundle-win
+        shell: bash
+      - name: Determine version
+        id: ver
+        run: |
+          echo "version=$(python3 -c "import sys; sys.path.insert(0,'src'); from myai_agent import __version__; print(__version__)")" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: myai-agent-${{ steps.ver.outputs.version }}-win-amd64
+          path: |
+            dist/win/myai-agent-${{ steps.ver.outputs.version }}-win-amd64.exe
+            dist/win/myai-agent-${{ steps.ver.outputs.version }}-win-amd64.exe.sha256
+          retention-days: 7
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [bundle-mac, bundle-win]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          echo "version=$(python3 -c "import sys; sys.path.insert(0,'src'); from myai_agent import __version__; print(__version__)")" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myai-agent-${{ steps.ver.outputs.version }}-mac-arm64
+          path: release/
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: myai-agent-${{ steps.ver.outputs.version }}-win-amd64
+          path: release/
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "myai-agent ${{ steps.ver.outputs.version }}"
+          body: |
+            ## myai-agent ${{ steps.ver.outputs.version }}
+
+            Standalone binaries — no Python or Ollama CLI required.
+            Download, set executable bit (macOS/Linux), and run.
+
+            ### macOS (Apple Silicon / arm64)
+            ```bash
+            curl -L -o myai-agent https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/myai-agent-${{ steps.ver.outputs.version }}-mac-arm64
+            chmod +x myai-agent
+            ./myai-agent start --wallet 0xYourAddress
+            ```
+
+            ### Windows (amd64)
+            Download `myai-agent-${{ steps.ver.outputs.version }}-win-amd64.exe` and run from Command Prompt or PowerShell.
+
+            ### Verify checksums
+            ```bash
+            sha256sum -c myai-agent-${{ steps.ver.outputs.version }}-mac-arm64.sha256
+            ```
+          files: release/**
+          draft: false
+          prerelease: false

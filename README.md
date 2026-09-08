@@ -36,6 +36,64 @@ myai-agent install --wallet 0xYourAddress
 
 ---
 
+## Packaged binaries (no Python required)
+
+Starting with v2.4.0 each GitHub release ships standalone executables for macOS
+(Apple Silicon arm64) and Windows (amd64).  They bundle Python + websocket-client
+so you don't need a local Python environment.
+
+### Install (macOS arm64)
+
+```bash
+VERSION=2.4.0
+curl -L -o myai-agent \
+  https://github.com/myaitoken/myai-agent/releases/download/v${VERSION}/myai-agent-${VERSION}-mac-arm64
+chmod +x myai-agent
+./myai-agent start --wallet 0xYourAddress
+```
+
+### Install (Windows amd64)
+
+Download `myai-agent-<version>-win-amd64.exe` from the [Releases page](https://github.com/myaitoken/myai-agent/releases), then:
+
+```powershell
+.\myai-agent-2.4.0-win-amd64.exe start --wallet 0xYourAddress
+```
+
+### Verify checksums
+
+A `.sha256` file is published alongside each binary:
+
+```bash
+sha256sum -c myai-agent-2.4.0-mac-arm64.sha256
+```
+
+### Upgrade
+
+To upgrade, stop the running agent, download the new binary, and restart:
+
+```bash
+# macOS / Linux
+myai-agent stop 2>/dev/null || true
+curl -L -o myai-agent \
+  https://github.com/myaitoken/myai-agent/releases/download/v2.4.0/myai-agent-2.4.0-mac-arm64
+chmod +x myai-agent
+./myai-agent start --wallet 0xYourAddress
+```
+
+```powershell
+# Windows — stop via Task Manager or:
+Stop-Process -Name "myai-agent*" -Force 2>$null
+# Download new .exe and run
+.\myai-agent-2.4.0-win-amd64.exe start --wallet 0xYourAddress
+```
+
+> **Note:** Your `agent_id` and `agent_secret` are stored in the config directory
+> (`~/Library/Application Support/myai-agent` on macOS, `%APPDATA%\myai-agent` on Windows)
+> and are preserved across upgrades — no need to re-register.
+
+---
+
 ## Requirements
 
 | Requirement | Details |
@@ -96,6 +154,7 @@ myai-agent status             Show service status and agent ID
 myai-agent logs               Tail live logs
 myai-agent models             List Ollama models available on this machine
 myai-agent run-job <prompt>   Run a one-off local inference job (for testing)
+myai-agent needle             Send a 6 k-token needle prompt and assert it is found (truncation test)
 myai-agent --version          Print version
 ```
 
@@ -123,6 +182,9 @@ myai-agent --version          Print version
 | `REQUIRED_MODELS` | `bonsai-8b:latest` | Comma-separated models to auto-pull |
 | `POLL_INTERVAL` | `5` | Seconds between job polls |
 | `HEARTBEAT_INTERVAL` | `30` | Seconds between heartbeats |
+| `MYAI_WS_URL` | _(derived)_ | Override WebSocket base URL (e.g. `ws://localhost:8000`) |
+| `MYAI_SHARD_ROOT` | — | Directory of shard files advertised in agent hello; omit to disable |
+| `MYAI_NUM_CTX` | `8192` | Ollama context window floor — prevents silent prompt truncation |
 
 **Disable auto-pull:**
 ```bash

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "myai-agent"
-version = "2.3.0"
+version = "2.4.0"
 description = "MyAI GPU compute agent — earn MYAI tokens by sharing your compute power"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -27,6 +27,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: System :: Distributed Computing",
 ]
+
+[project.optional-dependencies]
+ws = ["websocket-client>=1.6"]   # WebSocket dispatch (bundled in packaged binaries)
 
 [project.urls]
 Homepage    = "https://myaitoken.io"
