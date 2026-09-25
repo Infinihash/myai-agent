@@ -1,0 +1,27 @@
+# Shared Infinihash gitleaks ruleset (board #9945 / SOC 2 CC8.1 / ISO 27001 A.8.29).
+# Mirrors the Brain-side weekly scan config at
+# /opt/cron-checks/secret-scan/gitleaks.toml — keep the two in sync.
+title = "infinihash-secret-scan"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "infinihash-kyt-key"
+description = "Infinihash KYT API key (kyt_...)"
+regex = '''kyt_[A-Za-z0-9]{20,}'''
+keywords = ["kyt_"]
+[rules.allowlist]
+regexes = ['''kyt_(YOUR|test|example|xxx|placeholder|dummy|redacted|000000)''']
+
+[[rules]]
+id = "infinihash-clearauthority-key"
+description = "Infinihash ClearAuthority/ClosedLoop key (ca_/cl_...)"
+regex = '''\b(ca|cl)_[A-Za-z0-9]{24,}'''
+keywords = ["ca_", "cl_"]
+
+[[rules]]
+id = "infinihash-ih-key"
+description = "Infinihash internal key (ih_...)"
+regex = '''\bih_[A-Za-z0-9]{20,}'''
+keywords = ["ih_"]
