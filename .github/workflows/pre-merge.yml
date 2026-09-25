@@ -1,0 +1,102 @@
+# Pre-merge CI for myai-agent (the provider-side GPU agent: PyPI package,
+# PyInstaller bundles, Ed25519-signed auto-update).
+#
+# Until this file existed the repo had NO pull-request CI: the only test job
+# lived in bundle.yml and ran on release tags, i.e. after merge. Everything
+# below is BLOCKING.
+#
+# RUNNER CHOICE -- deliberately NOT [self-hosted, linux, x64]:
+#   Infinihash/myai-agent is a PUBLIC repository. The org's self-hosted runners
+#   (CT220/CT222) sit in the "Default" runner group, which has
+#   allows_public_repositories=false, so a self-hosted job here would queue
+#   forever. That setting is correct and must stay: a public repo accepts PRs
+#   from forks, and a runner that executes fork-authored code must not live on
+#   the LAN. GitHub-hosted ubuntu-latest (free for public repos) is what this
+#   repo's own bundle.yml test job already uses.
+#
+# Required status check name: "Pre-merge checks" (the job name below).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Pre-merge checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Same stub the Makefile's `make test` sets; not a real secret.
+      MYAI_ADMIN_SECRET: ci-stub-not-real
+      # Floor on collected tests. pytest's exit 5 ("no tests collected") already
+      # fails the job; this also catches a partial collection loss (a test file
+      # that silently stops being picked up). Raise it when tests are added.
+      MIN_TESTS: "81"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: No tracked Python bytecode (.pyc / __pycache__)
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files -- '*.pyc' '*.pyo' '*/__pycache__/*' '__pycache__/*')
+          if [ -n "$tracked" ]; then
+            echo "::error::Python bytecode is tracked in git -- remove with git rm --cached:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "No tracked .pyc/__pycache__ files."
+
+      - name: Create venv and install test deps
+        # The package itself is zero-dep stdlib; the tests additionally need
+        # cryptography (Ed25519 update-signature + attestation tests) and
+        # websocket-client (the [ws] extra used by /ws/agent dispatch).
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pytest cryptography "websocket-client>=1.6"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Python compile-check (src, tests, legacy)
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.py')
+          python -m py_compile $files && echo "$(echo "$files" | wc -w) .py files compile."
+
+      - name: Package imports and CLI entry point loads
+        env:
+          PYTHONPATH: src
+        run: |
+          set -euo pipefail
+          python -c "import myai_agent, myai_agent.cli, myai_agent.agent, myai_agent.update, myai_agent.config, myai_agent.attestation, myai_agent.gpu, myai_agent.installer; print('myai_agent', myai_agent.__version__)"
+
+      - name: Unit tests (pytest, tests/)
+        run: |
+          set -euo pipefail
+          # Count first so a collection regression is reported as such.
+          n=$(python -m pytest --collect-only -q tests/ | grep -cE '::' || true)
+          echo "Collected $n tests (floor $MIN_TESTS)."
+          if [ "$n" -lt "$MIN_TESTS" ]; then
+            echo "::error::Only $n tests collected, expected at least $MIN_TESTS -- a test file stopped being collected."
+            exit 1
+          fi
+          python -m pytest -q -rs tests/
+
+      - name: shellcheck install.sh (severity=error)
+        # shellcheck is preinstalled on GitHub-hosted ubuntu images.
+        run: |
+          set -euo pipefail
+          shellcheck --version | sed -n 2p
+          shellcheck -S error install.sh
