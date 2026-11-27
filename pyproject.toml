@@ -33,8 +33,8 @@ ws = ["websocket-client>=1.6"]   # WebSocket dispatch (bundled in packaged binar
 
 [project.urls]
 Homepage    = "https://myaitoken.io"
-Repository  = "https://github.com/myaitoken/myai-agent"
-"Bug Tracker" = "https://github.com/myaitoken/myai-agent/issues"
+Repository  = "https://github.com/Infinihash/myai-agent"
+"Bug Tracker" = "https://github.com/Infinihash/myai-agent/issues"
 
 [project.scripts]
 myai-agent = "myai_agent.cli:main"

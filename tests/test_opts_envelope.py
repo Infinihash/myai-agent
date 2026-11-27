@@ -207,7 +207,7 @@ class FakeServerTests(unittest.TestCase):
             _envelope_msg({"format": "json", "options": {"num_ctx": 16384}}),
             {"role": "user", "content": "needle?"},
         ]
-        text, meta = run_ollama_full("bonsai-8b", json.dumps(messages),
+        text, meta = run_ollama_full("llama3.2", json.dumps(messages),
                                      ollama_url=self.url, timeout=10)
 
         # Response text is trimmed.
@@ -226,14 +226,14 @@ class FakeServerTests(unittest.TestCase):
 
     def test_chat_without_envelope_gets_num_ctx_default(self):
         messages = [{"role": "user", "content": "hi"}]
-        run_ollama_full("bonsai-8b", json.dumps(messages),
+        run_ollama_full("llama3.2", json.dumps(messages),
                         ollama_url=self.url, timeout=10)
         sent = _FakeOllamaHandler.last_body
         # No envelope → belt-and-braces default applied.
         self.assertEqual(sent["options"]["num_ctx"], 8192)
 
     def test_generate_path_gets_num_ctx_default(self):
-        run_ollama_full("bonsai-8b", "plain prompt", ollama_url=self.url, timeout=10)
+        run_ollama_full("llama3.2", "plain prompt", ollama_url=self.url, timeout=10)
         sent = _FakeOllamaHandler.last_body
         self.assertEqual(_FakeOllamaHandler.last_path, "/api/generate")
         self.assertEqual(sent["options"]["num_ctx"], 8192)

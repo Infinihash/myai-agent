@@ -13,7 +13,7 @@
    - Copy the token (starts with `pypi-`)
 
 3. **Add the token to GitHub Secrets**
-   - Go to https://github.com/myaitoken/myai-agent/settings/secrets/actions
+   - Go to https://github.com/Infinihash/myai-agent/settings/secrets/actions
    - New repository secret → Name: `PYPI_API_TOKEN` → Value: paste token
 
 ## Publishing a new release
