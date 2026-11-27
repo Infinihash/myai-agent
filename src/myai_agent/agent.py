@@ -47,12 +47,21 @@ POLL_INTERVAL      = int(_env("POLL_INTERVAL",  "5"))
 HEARTBEAT_INTERVAL = int(_env("HEARTBEAT_INTERVAL", "30"))
 
 # Comma-separated list of models to auto-pull on startup (if not already present).
-# e.g. REQUIRED_MODELS=bonsai-8b:latest,deepseek-r1:7b
-# Default includes bonsai-8b as the lightweight required model.
-REQUIRED_MODELS_RAW = _env("REQUIRED_MODELS", "bonsai-8b:latest")
-REQUIRED_MODELS: List[str] = [
-    m.strip() for m in REQUIRED_MODELS_RAW.split(",") if m.strip()
-]
+# e.g. REQUIRED_MODELS=llama3.2,qwen2.5:7b   (set REQUIRED_MODELS="" to disable)
+# Default is llama3.2 (~2 GB, 3B): it exists on ollama.com, runs on CPU or any
+# GPU, and is a model the coordinator routes jobs to. It matches MODEL_SMALL in
+# the coordinator's canonical installer (static/install.sh); machines with
+# >= 8 GB VRAM / 16 GB unified memory should add qwen2.5:7b (MODEL_LARGE).
+DEFAULT_REQUIRED_MODELS = "llama3.2"
+
+
+def parse_required_models(raw: str) -> List[str]:
+    """Split a comma-separated model list, dropping blanks."""
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+REQUIRED_MODELS_RAW = _env("REQUIRED_MODELS", DEFAULT_REQUIRED_MODELS)
+REQUIRED_MODELS: List[str] = parse_required_models(REQUIRED_MODELS_RAW)
 
 # MYAI_WS_URL: override the WebSocket base URL independently of COORDINATOR_URL.
 # When unset, the WS URL is derived from COORDINATOR_URL by swapping the scheme.
